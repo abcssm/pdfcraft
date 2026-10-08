@@ -652,57 +652,112 @@ pub struct Endpoint {
 /// `{"method": "auth", "params": {"token": …}}`; anything else closes the connection.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn serve(client: ControlClient) -> std::io::Result<Endpoint> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let token = random_token()?;
     let expected = token.clone();
+    let open = Arc::new(AtomicUsize::new(0));
     std::thread::Builder::new().name("pdfcraft-control".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
-            let client = client.clone();
-            let expected = expected.clone();
-            let _ = std::thread::Builder::new().name("pdfcraft-control-conn".into()).spawn(move || {
-                let Ok(read) = stream.try_clone() else { return };
-                let mut write = stream;
-                let mut authed = false;
-                for line in BufReader::new(read).lines() {
-                    let Ok(line) = line else { break };
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let (reply, close) = match serde_json::from_str::<Value>(&line) {
-                        Err(e) => (rpc_error(Value::Null, -32700, &format!("parse error: {e}")), false),
-                        Ok(msg) => {
-                            let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-                            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                            if !authed {
-                                let ok =
-                                    method == "auth" && params.get("token").and_then(Value::as_str).is_some_and(|t| constant_time_eq(t, &expected));
-                                authed = ok;
-                                if ok {
-                                    (json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }), false)
-                                } else {
-                                    (rpc_error(id, -32001, "authenticate first: auth {token}"), true)
-                                }
-                            } else {
-                                let rx = client.send(method, params);
-                                match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                                    Ok(Ok(v)) => (json!({ "jsonrpc": "2.0", "id": id, "result": v }), false),
-                                    Ok(Err(e)) => (rpc_error(id, -32000, &e), false),
-                                    Err(_) => (rpc_error(id, -32002, "the app did not answer within 30 s"), false),
-                                }
-                            }
-                        }
-                    };
-                    if writeln!(write, "{reply}").and_then(|_| write.flush()).is_err() || close {
-                        break;
-                    }
-                }
+            // Any local process can connect: bound how many connections (threads) it can hold.
+            if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                open.fetch_sub(1, Ordering::SeqCst);
+                continue; // dropping the stream closes it
+            }
+            let (client, expected, conn_open) = (client.clone(), expected.clone(), open.clone());
+            let spawned = std::thread::Builder::new().name("pdfcraft-control-conn".into()).spawn(move || {
+                connection(stream, &client, &expected);
+                conn_open.fetch_sub(1, Ordering::SeqCst);
             });
+            if spawned.is_err() {
+                open.fetch_sub(1, Ordering::SeqCst);
+            }
         }
     })?;
     Ok(Endpoint { port, token })
+}
+
+/// At most this many control connections at once.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_CONNECTIONS: usize = 16;
+
+/// The longest request line accepted (a request is a small JSON object).
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_LINE: u64 = 4 << 20;
+
+/// How long a new connection may take to authenticate.
+#[cfg(not(target_arch = "wasm32"))]
+const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serve one connection. Until it authenticates, anything unexpected — a bad line, a line that
+/// is too long, silence beyond `AUTH_TIMEOUT` — closes it, so an unauthenticated peer can't
+/// exhaust memory or hold the connection open.
+#[cfg(not(target_arch = "wasm32"))]
+fn connection(stream: std::net::TcpStream, client: &ControlClient, expected: &str) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let Ok(read) = stream.try_clone() else { return };
+    // On the handle that reads: on Windows a duplicated socket keeps its own timeout.
+    if read.set_read_timeout(Some(AUTH_TIMEOUT)).is_err() {
+        return;
+    }
+    let mut write = stream;
+    let mut reader = BufReader::new(read);
+    let mut authed = false;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match (&mut reader).take(MAX_LINE + 1).read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if buf.len() as u64 > MAX_LINE {
+            let _ = writeln!(write, "{}", rpc_error(Value::Null, -32600, "request line too long"));
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            let _ = writeln!(write, "{}", rpc_error(Value::Null, -32700, "parse error: not UTF-8"));
+            if authed {
+                continue;
+            }
+            break;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (reply, close) = match serde_json::from_str::<Value>(line) {
+            Err(e) => (rpc_error(Value::Null, -32700, &format!("parse error: {e}")), !authed),
+            Ok(msg) => {
+                let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                if !authed {
+                    let ok = method == "auth" && params.get("token").and_then(Value::as_str).is_some_and(|t| constant_time_eq(t, expected));
+                    authed = ok;
+                    // An authenticated agent may pause between requests for as long as it likes.
+                    if ok && reader.get_ref().set_read_timeout(None).is_err() {
+                        break;
+                    }
+                    if ok {
+                        (json!({ "jsonrpc": "2.0", "id": id, "result": { "ok": true } }), false)
+                    } else {
+                        (rpc_error(id, -32001, "authenticate first: auth {token}"), true)
+                    }
+                } else {
+                    let rx = client.send(method, params);
+                    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                        Ok(Ok(v)) => (json!({ "jsonrpc": "2.0", "id": id, "result": v }), false),
+                        Ok(Err(e)) => (rpc_error(id, -32000, &e), false),
+                        Err(_) => (rpc_error(id, -32002, "the app did not answer within 30 s"), false),
+                    }
+                }
+            }
+        };
+        if writeln!(write, "{reply}").and_then(|_| write.flush()).is_err() || close {
+            break;
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -806,6 +806,45 @@ fn loopback_transport_requires_the_token() {
 }
 
 #[test]
+fn unauthenticated_peers_cant_flood_or_linger() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let (_h, c) = harness();
+    let ep = pdfcraft_ui_egui::control::serve(c).unwrap();
+    let connect = || std::net::TcpStream::connect(("127.0.0.1", ep.port)).unwrap();
+    let closed = |s: std::net::TcpStream| {
+        s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+        let mut rest = Vec::new();
+        // The reply (if any), then end-of-file or a reset: the server hung up. Only a timeout
+        // means it is still holding the connection.
+        match BufReader::new(s).read_to_end(&mut rest) {
+            Ok(_) => true,
+            Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+        }
+    };
+
+    // A parse error before auth used to keep the connection open for more.
+    let mut s = connect();
+    writeln!(s, "not json").unwrap();
+    let mut reply = String::new();
+    BufReader::new(s.try_clone().unwrap()).read_line(&mut reply).unwrap();
+    assert!(reply.contains("-32700"), "{reply}");
+    assert!(closed(s));
+
+    // A line with no end used to be buffered without limit; it is cut off at 4 MiB.
+    let mut s = connect();
+    let chunk = vec![b'x'; 1 << 20];
+    for _ in 0..5 {
+        if s.write_all(&chunk).is_err() {
+            break; // already closed
+        }
+    }
+    assert!(closed(s));
+
+    // Saying nothing: disconnected after the authentication timeout.
+    assert!(closed(connect()));
+}
+
+#[test]
 fn control_default_workspace_and_session_override() {
     let (mut h, c) = harness();
     ok(&mut h, &c, "ui.set", json!({"key": "default-mode", "value": "edit"}));
