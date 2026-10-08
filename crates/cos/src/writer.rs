@@ -207,7 +207,9 @@ pub fn write_incremental(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, 
     if let Some(p) = prev {
         trailer.set(b"Prev".to_vec(), Object::Int(p as i64));
     }
-    let size = doc.next_num().max(trailer.int(b"Size").unwrap_or(0) as u32);
+    // A hostile or negative `/Size` must not wrap: the next number is already past every object.
+    let declared = trailer.int(b"Size").unwrap_or(0).clamp(0, i64::from(crate::document::MAX_OBJECT_NUMBER) + 1) as u32; // in range: clamped
+    let size = doc.next_num().max(declared);
     if as_stream {
         let rows = offsets.iter().map(|(n, (o, g, used))| (*n, if *used { Row::InFile(*o, *g) } else { Row::Free(*g) })).collect();
         write_xref_stream(&mut out, &mut trailer, rows, size);
