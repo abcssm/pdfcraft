@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod commands;
 pub mod compare;
 pub mod export;
+pub mod fsutil;
 pub mod js;
 pub mod links;
 pub mod ocr;

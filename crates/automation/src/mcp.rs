@@ -46,12 +46,16 @@ impl McpServer {
 
     /// Serve until `input` reaches end of file.
     pub fn serve(&mut self, input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
-        for line in input.lines() {
+        // Raw lines: one that isn't UTF-8 gets a parse error, where `lines()` would end the
+        // session (and lose every open document's unsaved edits).
+        for line in input.split(b'\n') {
             let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(reply) = self.handle_line(&line) {
+            let reply = match std::str::from_utf8(&line) {
+                Ok(l) if l.trim().is_empty() => continue,
+                Ok(l) => self.handle_line(l),
+                Err(e) => Some(error(Value::Null, PARSE_ERROR, &format!("parse error: not UTF-8 ({e})")).to_string()),
+            };
+            if let Some(reply) = reply {
                 writeln!(output, "{reply}")?;
                 output.flush()?;
             }
