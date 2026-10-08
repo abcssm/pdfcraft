@@ -312,10 +312,25 @@ impl Certificate {
     /// file" makes. Valid from `from` for `years`; usable for signing (digital signature and
     /// non-repudiation).
     pub fn self_signed(name: &Name, key: &PrivateKey, from: Time, years: u32, serial: &[u8]) -> Result<Certificate, SignError> {
+        Self::issue(name, &key.public_key().spki(), (name, key), from, years, serial, false)
+    }
+
+    /// A certificate for `subject` (whose public key is `spki`), signed by `issuer`. `ca` adds
+    /// basic constraints `cA = TRUE` and the keyCertSign usage.
+    fn issue(
+        subject: &Name,
+        spki: &[u8],
+        issuer: (&Name, &PrivateKey),
+        from: Time,
+        years: u32,
+        serial: &[u8],
+        ca: bool,
+    ) -> Result<Certificate, SignError> {
+        let (issuer_name, key) = issuer;
         let alg = key.preferred_digest();
         let sig_alg = key.signature_algorithm(alg);
-        let until = Time { year: from.year + years, ..from };
-        let spki = key.public_key().spki();
+        let until = Time { year: from.year.saturating_add(years), ..from };
+        let spki = spki.to_vec();
         let ski = DigestAlg::Sha1.digest(&[&spki]);
         let ext = |o: &str, critical: bool, value: &[u8]| {
             if critical {
@@ -324,21 +339,27 @@ impl Certificate {
                 der::seq(&[&der::oid(o), &der::octets(value)])
             }
         };
-        // keyUsage: digitalSignature (bit 0) and nonRepudiation (bit 1) → 0b1100_0000, 6 unused bits.
-        let key_usage = der::tlv(tag::BIT_STRING, &[6, 0b1100_0000]);
-        let extensions = der::seq(&[
-            &ext("2.5.29.15", true, &key_usage),
-            &ext("2.5.29.14", false, &der::octets(&ski)),
-            // extKeyUsage: emailProtection and Adobe's document signing (1.2.840.113583.1.1.5).
-            &ext("2.5.29.37", false, &der::seq(&[&der::oid("1.3.6.1.5.5.7.3.4"), &der::oid("1.2.840.113583.1.1.5")])),
-        ]);
+        // keyUsage: digitalSignature (bit 0) and nonRepudiation (bit 1) → 0b1100_0000, 6 unused bits;
+        // a CA also gets keyCertSign (bit 5) → 0b1100_0100, 2 unused bits.
+        let key_usage = if ca { der::tlv(tag::BIT_STRING, &[2, 0b1100_0100]) } else { der::tlv(tag::BIT_STRING, &[6, 0b1100_0000]) };
+        let basic_constraints = ext("2.5.29.19", true, &der::seq(&[&der::boolean(true)]));
+        let mut exts: Vec<&[u8]> = Vec::new();
+        let key_usage = ext("2.5.29.15", true, &key_usage);
+        let ski = ext("2.5.29.14", false, &der::octets(&ski));
+        // extKeyUsage: emailProtection and Adobe's document signing (1.2.840.113583.1.1.5).
+        let eku = ext("2.5.29.37", false, &der::seq(&[&der::oid("1.3.6.1.5.5.7.3.4"), &der::oid("1.2.840.113583.1.1.5")]));
+        if ca {
+            exts.push(&basic_constraints);
+        }
+        exts.extend([key_usage.as_slice(), &ski, &eku]);
+        let extensions = der::seq(&exts);
         let tbs = der::seq(&[
             &der::explicit(0, &der::int(2)),
             &der::uint(serial),
             &sig_alg,
-            &name.raw,
+            &issuer_name.raw,
             &der::seq(&[&from.encode(), &until.encode()]),
-            &name.raw,
+            &subject.raw,
             &spki,
             &der::explicit(3, &extensions),
         ]);
@@ -348,8 +369,20 @@ impl Certificate {
     }
 }
 
+impl Certificate {
+    /// May issue certificates (RFC 5280 §4.2.1.9, §4.2.1.3): basic constraints say it is a CA,
+    /// and its key usage, if present, includes keyCertSign.
+    pub fn can_issue(&self) -> bool {
+        self.is_ca && self.key_usage.is_none_or(|u| u & (1 << 5) != 0)
+    }
+}
+
 /// The chain from `leaf` up through `pool`, as far as issuers can be found and their keys
 /// verify the certificate below. Stops at a self-signed certificate.
+///
+/// Only CA certificates may issue: otherwise anyone holding an ordinary certificate from a
+/// trusted CA could use its key to mint a certificate in someone else's name that chains to
+/// that CA.
 pub fn build_chain<'a>(leaf: &'a Certificate, pool: &'a [Certificate]) -> Vec<&'a Certificate> {
     let mut chain = vec![leaf];
     while chain.len() < 10 {
@@ -357,7 +390,9 @@ pub fn build_chain<'a>(leaf: &'a Certificate, pool: &'a [Certificate]) -> Vec<&'
         if last.issuer.raw == last.subject.raw {
             break;
         }
-        let Some(issuer) = pool.iter().find(|c| c.subject.raw == last.issuer.raw && !chain.contains(c) && last.signed_by(&c.public_key)) else {
+        let Some(issuer) =
+            pool.iter().find(|c| c.subject.raw == last.issuer.raw && c.can_issue() && !chain.contains(c) && last.signed_by(&c.public_key))
+        else {
             break;
         };
         chain.push(issuer);
@@ -454,6 +489,40 @@ mod xfa_ext_tests {
         let mut ext = Extensions::default();
         ext.read("2.5.29.31", &extn);
         assert_eq!(ext.crl_urls.len(), 2);
+    }
+
+    #[test]
+    fn only_ca_certificates_extend_a_chain() {
+        let when = Time { year: 2026, month: 1, day: 1, hour: 0, minute: 0, second: 0 };
+        let named = |cn: &str| Name::build(cn, "", "", "", "");
+        let root_key = PrivateKey::generate_p256().unwrap();
+        let root = Certificate::issue(&named("Root"), &root_key.public_key().spki(), (&named("Root"), &root_key), when, 10, &[1], true).unwrap();
+        // An ordinary signing certificate the root issued to Mallory…
+        let mallory_key = PrivateKey::generate_p256().unwrap();
+        let mallory =
+            Certificate::issue(&named("Mallory"), &mallory_key.public_key().spki(), (&named("Root"), &root_key), when, 5, &[2], false).unwrap();
+        // …whose key Mallory uses to mint a certificate in Victim's name.
+        let forged_key = PrivateKey::generate_p256().unwrap();
+        let forged =
+            Certificate::issue(&named("Victim"), &forged_key.public_key().spki(), (&named("Mallory"), &mallory_key), when, 5, &[3], false).unwrap();
+        let pool = [root.clone(), mallory.clone()];
+        assert_eq!(build_chain(&forged, &pool), [&forged], "a non-CA can't issue");
+        // A real intermediate CA still links up to the root.
+        let ca_key = PrivateKey::generate_p256().unwrap();
+        let ca = Certificate::issue(&named("Issuing CA"), &ca_key.public_key().spki(), (&named("Root"), &root_key), when, 5, &[4], true).unwrap();
+        let alice = Certificate::issue(
+            &named("Alice"),
+            &PrivateKey::generate_p256().unwrap().public_key().spki(),
+            (&named("Issuing CA"), &ca_key),
+            when,
+            5,
+            &[5],
+            false,
+        )
+        .unwrap();
+        let pool = [root.clone(), ca.clone()];
+        assert_eq!(build_chain(&alice, &pool), [&alice, &ca, &root]);
+        assert!(root.can_issue() && ca.can_issue() && !mallory.can_issue());
     }
 
     #[test]
