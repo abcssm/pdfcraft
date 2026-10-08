@@ -237,9 +237,79 @@ fn vectors_are_removed_or_clipped_and_inline_images_go() {
     assert_eq!((r.paths_removed, r.paths_clipped, r.images_removed), (1, 1, 1), "{r:?}");
     let c = content(&doc, 0);
     assert!(!c.contains("10 10 20 20 re"), "{c}");
-    assert!(c.contains("W*\nn\n0 0 300 300 re\nf\nQ"), "the page-size rect is clipped: {c}");
+    // The page-size rect is cut, not just clipped: it used to stay whole behind a clip, so its
+    // geometry inside the regions came back by deleting the clip.
+    assert!(!c.contains("0 0 300 300 re"), "{c}");
+    assert!(c.contains("65 0 m\n300 0 l\n300 300 l\n65 300 l\nh"), "the part right of the regions stays: {c}");
     assert!(!c.contains("BI"), "{c}");
     assert!(c.contains("150 150 m"), "the line elsewhere stays");
+    assert_eq!(under(&mut doc, 0, &[[5.0, 5.0, 35.0, 35.0], [45.0, 45.0, 65.0, 65.0]]), 0);
+}
+
+/// Every coordinate of the page's paths (not the redaction boxes), in user space.
+fn path_points(doc: &Document) -> Vec<(f64, f64)> {
+    let p = pdfcraft_model::pages(doc).swap_remove(0);
+    let (list, data) = page_streams(doc, &p.dict, 0).unwrap();
+    let mut pts = Vec::new();
+    for (o, d) in list.iter().zip(data) {
+        if doc.resolve(o).as_dict().and_then(|d| d.name(b"PCMark")) == Some(b"Redaction") {
+            continue;
+        }
+        let mut ctm = pdfcraft_content::Matrix::IDENTITY;
+        let mut stack = Vec::new();
+        for op in pdfcraft_content::parse(&d).ops {
+            match op.op.as_slice() {
+                b"q" => stack.push(ctm),
+                b"Q" => ctm = stack.pop().unwrap_or(ctm),
+                b"cm" => ctm = pdfcraft_content::Matrix(op.nums::<6>().unwrap()).then(&ctm),
+                b"m" | b"l" | b"c" | b"v" | b"y" => {
+                    let n: Vec<f64> = op.operands.iter().filter_map(Object::as_f64).collect();
+                    pts.extend(n.chunks(2).map(|c| ctm.apply(c[0], c[1])));
+                }
+                b"re" => {
+                    let [x, y, w, h] = op.nums::<4>().unwrap();
+                    pts.extend([(x, y), (x + w, y), (x, y + h), (x + w, y + h)].map(|(a, b)| ctm.apply(a, b)));
+                }
+                _ => {}
+            }
+        }
+    }
+    pts
+}
+
+#[test]
+fn outlined_text_and_signatures_lose_every_point_under_the_mark() {
+    // Text converted to outlines (filled curves) and a drawn signature (a stroked polyline with
+    // curves) that run across the mark, under a scaled CTM and inside a clip-and-paint path.
+    let src = b"q 2 0 0 2 0 0 cm \
+        20 20 m 40 20 l 40 40 30 50 20 40 c h 60 20 m 80 20 l 80 40 l 60 40 l h f \
+        10 70 m 30 90 50 50 70 70 c 90 90 l 110 60 l S \
+        60 10 m 100 10 l 100 30 l 60 30 l h W f Q";
+    let mut doc = one_page(src, "", vec![]);
+    let region = [70.0, 30.0, 130.0, 170.0];
+    mark(&mut doc, 0, &[region], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.paths_clipped, 3, "{r:?}");
+    let pts = path_points(&doc);
+    let inside: Vec<_> =
+        pts.iter().filter(|p| p.0 > region[0] + 1e-6 && p.0 < region[2] - 1e-6 && p.1 > region[1] + 1e-6 && p.1 < region[3] - 1e-6).collect();
+    assert!(
+        inside.is_empty(),
+        "points under the mark: {inside:?}
+{}",
+        content(&doc, 0)
+    );
+    // What lies outside survives: the left glyph's base, the start of the signature.
+    assert!(pts.iter().any(|p| (p.0 - 40.0).abs() < 1e-6 && (p.1 - 40.0).abs() < 1e-6), "{pts:?}");
+    assert!(pts.iter().any(|p| (p.0 - 20.0).abs() < 1e-6 && (p.1 - 140.0).abs() < 1e-6), "{pts:?}");
+    assert_eq!(under(&mut doc, 0, &[region]), 0);
+}
+
+#[test]
+fn verification_catches_vectors_left_under_a_mark() {
+    let mut doc = one_page(b"0 0 m 100 100 l S 0 50 m 100 50 l S", "", vec![]);
+    assert_eq!(under(&mut doc, 0, &[[40.0, 40.0, 60.0, 60.0]]), 2, "both lines cross the region");
+    assert_eq!(under(&mut doc, 0, &[[40.0, 60.0, 45.0, 80.0]]), 0, "neither does");
 }
 
 #[test]

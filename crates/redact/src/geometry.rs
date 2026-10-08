@@ -320,13 +320,20 @@ pub(crate) fn cut_stroke(subs: &[Subpath], rects: &[[f64; 4]], close_all: bool) 
     lines
 }
 
-/// Does any painted line of `subs` (strokes, or fill edges) run inside a region for more than a
-/// hundredth of a point? `rects` should be shrunk slightly, so geometry cut exactly along a
-/// region's edge doesn't count.
-pub(crate) fn crosses(subs: &[Subpath], rects: &[[f64; 4]]) -> bool {
+/// `r` shrunk by `d` on every side (never inverted).
+pub(crate) fn inset(r: [f64; 4], d: f64) -> [f64; 4] {
+    let (cx, cy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
+    [(r[0] + d).min(cx), (r[1] + d).min(cy), (r[2] - d).max(cx), (r[3] - d).max(cy)]
+}
+
+/// Does any line of `subs` run inside a region for more than a hundredth of a point? `fill`:
+/// every subpath is implicitly closed (its edges are the fill's outline). `rects` should be
+/// shrunk slightly, so geometry cut exactly along a region's edge doesn't count.
+pub(crate) fn crosses(subs: &[Subpath], rects: &[[f64; 4]], fill: bool) -> bool {
     subs.iter().any(|s| {
         let mut pts = s.pts.clone();
-        if pts.len() > 2
+        if (fill || s.closed)
+            && pts.len() > 2
             && let Some(&first) = pts.first()
         {
             pts.push(first);
@@ -419,8 +426,14 @@ mod tests {
         assert!(!fill.is_empty() && fill.iter().flatten().all(|&p| !inside_any(p, &r)));
         let stroke = cut_stroke(&s, &r, false);
         assert!(!stroke.is_empty() && stroke.iter().flatten().all(|&p| !inside_any(p, &r)));
-        assert!(!crosses(&[Subpath { pts: stroke.concat(), closed: false }], &r));
-        assert!(crosses(&s, &r), "the uncut circle runs through the region");
+        // The fill's cut edge runs along the region's edge: checked against the region shrunk a
+        // little, as the verifier does.
+        let shrunk = [inset(r[0], 0.05)];
+        let pieces: Vec<Subpath> = stroke.into_iter().map(|pts| Subpath { pts, closed: false }).collect();
+        assert!(!crosses(&pieces, &shrunk, false));
+        let polys: Vec<Subpath> = fill.into_iter().map(|pts| Subpath { pts, closed: true }).collect();
+        assert!(!crosses(&polys, &shrunk, true));
+        assert!(crosses(&s, &shrunk, true), "the uncut circle runs through the region");
     }
 
     #[test]

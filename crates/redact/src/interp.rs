@@ -23,7 +23,7 @@ use std::rc::Rc;
 use pdfcraft_content::{Matrix, Op, contains, num, overlaps, parse, serialize_ops, string};
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 
-use crate::{Report, image};
+use crate::{Report, geometry, image};
 use pdfcraft_fonts::pdf::Metrics;
 
 const MAX_DEPTH: usize = 12;
@@ -198,13 +198,89 @@ fn fresh_name(scope: &mut Scope<'_>, xobjects: &Dict) -> Vec<u8> {
     }
 }
 
+/// Rewrite a path that a region touches, ended by painting operator `o` (and clipping when
+/// `clips`): nothing of it may stay inside a region, not even coordinates hidden by a clip.
+///
+/// A path wholly under a region goes. Otherwise its geometry is cut ([`geometry`]): the fill
+/// loses the area inside the regions and the stroke the segments inside them. The painting is
+/// still drawn under a clip that excludes the regions, so stroke widths don't reach into them.
+/// A clipping path is cut the same way (its area inside the regions can only hide content that
+/// is gone). A path that can't be cut is removed; a clip that can't be cut becomes an empty
+/// clip, which hides rather than reveals.
+fn cut_path(scope: &mut Scope<'_>, ctm: &Matrix, bbox: [f64; 4], body: &[Op], o: &[u8], clips: bool, ops: &mut Vec<Op>) {
+    let even_odd_clip = body.iter().any(|p| p.is("W*"));
+    let clip_op = if even_odd_clip { "W*" } else { "W" };
+    let empty_clip = |ops: &mut Vec<Op>| {
+        ops.push(Op::new("re", vec![num(0.0), num(0.0), num(0.0), num(0.0)]));
+        ops.push(Op::new("W", vec![]));
+        ops.push(Op::new("n", vec![]));
+    };
+    let inv = ctm.invert();
+    let subs = inv.and_then(|_| geometry::flatten(body, ctm));
+    let (Some(inv), Some(subs)) = (inv, subs) else {
+        scope.report.paths_removed += 1;
+        if clips {
+            empty_clip(ops);
+        }
+        return;
+    };
+    if scope.covered(bbox) {
+        scope.report.paths_removed += 1;
+    } else if o != b"n" {
+        let fill_rule = match o {
+            b"f" | b"F" | b"B" | b"b" => Some("f"),
+            b"f*" | b"B*" | b"b*" => Some("f*"),
+            _ => None,
+        };
+        let mut painted: Vec<Op> = Vec::new();
+        if let Some(rule) = fill_rule
+            && let Some(polys) = geometry::cut_fill(&subs, scope.rects)
+            && !polys.is_empty()
+        {
+            painted.extend(geometry::path_ops(&polys, &inv, true));
+            painted.push(Op::new(rule, vec![]));
+        }
+        if matches!(o, b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*") {
+            let lines = geometry::cut_stroke(&subs, scope.rects, matches!(o, b"s" | b"b" | b"b*"));
+            if !lines.is_empty() {
+                painted.extend(geometry::path_ops(&lines, &inv, false));
+                painted.push(Op::new("S", vec![]));
+            }
+        }
+        if painted.is_empty() {
+            scope.report.paths_removed += 1;
+        } else {
+            scope.report.paths_clipped += 1;
+            ops.push(Op::new("q", vec![]));
+            if let Some(c) = clip_out(scope.rects, ctm, bbox) {
+                ops.extend(c);
+            }
+            ops.extend(painted);
+            ops.push(Op::new("Q", vec![]));
+        }
+    }
+    if clips {
+        match geometry::cut_fill(&subs, scope.rects) {
+            Some(polys) if !polys.is_empty() => {
+                ops.extend(geometry::path_ops(&polys, &inv, true));
+                ops.push(Op::new(clip_op, vec![]));
+                ops.push(Op::new("n", vec![]));
+            }
+            _ => empty_clip(ops),
+        }
+    }
+}
+
 /// The clip that hides everything inside each region: one even-odd clip per region (a big
 /// rectangle with the region cut out), in the current user space. Returns `None` when the CTM
 /// can't be inverted (nothing is painted then anyway).
 fn clip_out(rects: &[[f64; 4]], ctm: &Matrix, around: [f64; 4]) -> Option<Vec<Op>> {
     let inv = ctm.invert()?;
     let mut ops = Vec::new();
-    let big = [around[0] - 10.0, around[1] - 10.0, around[2] + 10.0, around[3] + 10.0];
+    // Around the content and the regions it touches, so no corner of the box lies in a region.
+    let hit: Vec<&[f64; 4]> = rects.iter().filter(|r| overlaps(**r, around, 0.0)).collect();
+    let span = hit.iter().fold(around, |b, r| [b[0].min(r[0]), b[1].min(r[1]), b[2].max(r[2]), b[3].max(r[3])]);
+    let big = [span[0] - 10.0, span[1] - 10.0, span[2] + 10.0, span[3] + 10.0];
     for r in rects.iter().filter(|r| overlaps(**r, around, 0.0)) {
         let outer = [(big[0], big[1]), (big[2], big[1]), (big[2], big[3]), (big[0], big[3])];
         let inner = [(r[0], r[1]), (r[0], r[3]), (r[2], r[3]), (r[2], r[1])];
@@ -308,7 +384,23 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 let body = std::mem::take(&mut path);
                 let bbox = path_box.take();
                 let clips = std::mem::replace(&mut clip, false);
-                let hit = scope.mode == Mode::Apply && o != b"n" && bbox.is_some_and(|b| scope.hits(b));
+                // A straight horizontal or vertical line has a flat box: widen it a hair so it
+                // still counts as touching a region it crosses.
+                let hit = bbox.is_some_and(|b| scope.hits([b[0] - 1e-6, b[1] - 1e-6, b[2] + 1e-6, b[3] + 1e-6]));
+                if scope.mode == Mode::Verify {
+                    // Painted geometry must not run inside a region: cut paths only touch their
+                    // edges, so check against the regions shrunk a little.
+                    if hit && o != b"n" {
+                        let shrunk: Vec<[f64; 4]> = scope.rects.iter().map(|&r| geometry::inset(r, 0.05)).collect();
+                        let fill = !matches!(o, b"S" | b"s");
+                        if geometry::flatten(&body, &gs.ctm).is_none_or(|subs| geometry::crosses(&subs, &shrunk, fill)) {
+                            out.residue += 1;
+                        }
+                    }
+                    ops.extend(body);
+                    ops.push(op);
+                    continue;
+                }
                 if !hit {
                     ops.extend(body);
                     ops.push(op);
@@ -316,37 +408,7 @@ pub(crate) fn process(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<
                 }
                 let b = bbox.unwrap_or_default();
                 changed = true;
-                if scope.covered(b) {
-                    scope.report.paths_removed += 1;
-                    if clips {
-                        // Keep the clipping, drop the painting.
-                        ops.extend(body);
-                        ops.push(Op::new("n", vec![]));
-                    }
-                } else if clips {
-                    // A clip-and-paint path can't be wrapped in q/Q without losing its clip:
-                    // paint it clipped, then set its clip with a no-op path.
-                    scope.report.paths_clipped += 1;
-                    if let Some(c) = clip_out(scope.rects, &gs.ctm, b) {
-                        let plain: Vec<Op> = body.iter().filter(|p| !p.is("W") && !p.is("W*")).cloned().collect();
-                        ops.push(Op::new("q", vec![]));
-                        ops.extend(c);
-                        ops.extend(plain);
-                        ops.push(op);
-                        ops.push(Op::new("Q", vec![]));
-                    }
-                    ops.extend(body);
-                    ops.push(Op::new("n", vec![]));
-                } else {
-                    scope.report.paths_clipped += 1;
-                    if let Some(c) = clip_out(scope.rects, &gs.ctm, b) {
-                        ops.push(Op::new("q", vec![]));
-                        ops.extend(c);
-                        ops.extend(body);
-                        ops.push(op);
-                        ops.push(Op::new("Q", vec![]));
-                    }
-                }
+                cut_path(scope, &gs.ctm, b, &body, o, clips, &mut ops);
                 continue;
             }
             if !path.is_empty() {

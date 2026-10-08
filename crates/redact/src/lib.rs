@@ -16,6 +16,7 @@
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 
+mod geometry;
 mod image;
 mod interp;
 pub mod patterns;
