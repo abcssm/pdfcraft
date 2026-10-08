@@ -237,9 +237,79 @@ fn vectors_are_removed_or_clipped_and_inline_images_go() {
     assert_eq!((r.paths_removed, r.paths_clipped, r.images_removed), (1, 1, 1), "{r:?}");
     let c = content(&doc, 0);
     assert!(!c.contains("10 10 20 20 re"), "{c}");
-    assert!(c.contains("W*\nn\n0 0 300 300 re\nf\nQ"), "the page-size rect is clipped: {c}");
+    // The page-size rect is cut, not just clipped: it used to stay whole behind a clip, so its
+    // geometry inside the regions came back by deleting the clip.
+    assert!(!c.contains("0 0 300 300 re"), "{c}");
+    assert!(c.contains("65 0 m\n300 0 l\n300 300 l\n65 300 l\nh"), "the part right of the regions stays: {c}");
     assert!(!c.contains("BI"), "{c}");
     assert!(c.contains("150 150 m"), "the line elsewhere stays");
+    assert_eq!(under(&mut doc, 0, &[[5.0, 5.0, 35.0, 35.0], [45.0, 45.0, 65.0, 65.0]]), 0);
+}
+
+/// Every coordinate of the page's paths (not the redaction boxes), in user space.
+fn path_points(doc: &Document) -> Vec<(f64, f64)> {
+    let p = pdfcraft_model::pages(doc).swap_remove(0);
+    let (list, data) = page_streams(doc, &p.dict, 0).unwrap();
+    let mut pts = Vec::new();
+    for (o, d) in list.iter().zip(data) {
+        if doc.resolve(o).as_dict().and_then(|d| d.name(b"PCMark")) == Some(b"Redaction") {
+            continue;
+        }
+        let mut ctm = pdfcraft_content::Matrix::IDENTITY;
+        let mut stack = Vec::new();
+        for op in pdfcraft_content::parse(&d).ops {
+            match op.op.as_slice() {
+                b"q" => stack.push(ctm),
+                b"Q" => ctm = stack.pop().unwrap_or(ctm),
+                b"cm" => ctm = pdfcraft_content::Matrix(op.nums::<6>().unwrap()).then(&ctm),
+                b"m" | b"l" | b"c" | b"v" | b"y" => {
+                    let n: Vec<f64> = op.operands.iter().filter_map(Object::as_f64).collect();
+                    pts.extend(n.chunks(2).map(|c| ctm.apply(c[0], c[1])));
+                }
+                b"re" => {
+                    let [x, y, w, h] = op.nums::<4>().unwrap();
+                    pts.extend([(x, y), (x + w, y), (x, y + h), (x + w, y + h)].map(|(a, b)| ctm.apply(a, b)));
+                }
+                _ => {}
+            }
+        }
+    }
+    pts
+}
+
+#[test]
+fn outlined_text_and_signatures_lose_every_point_under_the_mark() {
+    // Text converted to outlines (filled curves) and a drawn signature (a stroked polyline with
+    // curves) that run across the mark, under a scaled CTM and inside a clip-and-paint path.
+    let src = b"q 2 0 0 2 0 0 cm \
+        20 20 m 40 20 l 40 40 30 50 20 40 c h 60 20 m 80 20 l 80 40 l 60 40 l h f \
+        10 70 m 30 90 50 50 70 70 c 90 90 l 110 60 l S \
+        60 10 m 100 10 l 100 30 l 60 30 l h W f Q";
+    let mut doc = one_page(src, "", vec![]);
+    let region = [70.0, 30.0, 130.0, 170.0];
+    mark(&mut doc, 0, &[region], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.paths_clipped, 3, "{r:?}");
+    let pts = path_points(&doc);
+    let inside: Vec<_> =
+        pts.iter().filter(|p| p.0 > region[0] + 1e-6 && p.0 < region[2] - 1e-6 && p.1 > region[1] + 1e-6 && p.1 < region[3] - 1e-6).collect();
+    assert!(
+        inside.is_empty(),
+        "points under the mark: {inside:?}
+{}",
+        content(&doc, 0)
+    );
+    // What lies outside survives: the left glyph's base, the start of the signature.
+    assert!(pts.iter().any(|p| (p.0 - 40.0).abs() < 1e-6 && (p.1 - 40.0).abs() < 1e-6), "{pts:?}");
+    assert!(pts.iter().any(|p| (p.0 - 20.0).abs() < 1e-6 && (p.1 - 140.0).abs() < 1e-6), "{pts:?}");
+    assert_eq!(under(&mut doc, 0, &[region]), 0);
+}
+
+#[test]
+fn verification_catches_vectors_left_under_a_mark() {
+    let mut doc = one_page(b"0 0 m 100 100 l S 0 50 m 100 50 l S", "", vec![]);
+    assert_eq!(under(&mut doc, 0, &[[40.0, 40.0, 60.0, 60.0]]), 2, "both lines cross the region");
+    assert_eq!(under(&mut doc, 0, &[[40.0, 60.0, 45.0, 80.0]]), 0, "neither does");
 }
 
 #[test]
@@ -458,4 +528,109 @@ fn tags_lose_what_redaction_removed() {
     let public = doc.get(pdfcraft_cos::ObjRef::new(10, 0)).as_dict().cloned().unwrap();
     assert_eq!(public.get(b"K").and_then(Object::as_int), Some(1));
     assert!(public.get(b"ActualText").is_some(), "untouched content keeps its tags");
+}
+
+/// Does `o` (strings, names, nested values, decoded stream data) contain `needle`?
+fn holds(o: &Object, needle: &[u8]) -> bool {
+    let has = |b: &[u8]| b.windows(needle.len()).any(|w| w == needle);
+    match o {
+        Object::String(s) => has(&s.bytes),
+        Object::Name(n) => has(n),
+        Object::Array(a) => a.iter().any(|x| holds(x, needle)),
+        Object::Dict(d) => d.iter().any(|(k, v)| has(k) || holds(v, needle)),
+        Object::Stream(s) => s.dict.iter().any(|(_, v)| holds(v, needle)) || s.decoded().is_ok_and(|d| has(&d)),
+        _ => false,
+    }
+}
+
+#[test]
+fn nothing_redacted_survives_a_save() {
+    // The secret sits in every place redaction must reach: page text, a form XObject, a comment
+    // (referenced from the structure tree, with alternate text), a form field (listed in the
+    // calculation order and in the XFA data) and the page thumbnail.
+    let secret = b"SECRET-4242";
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /AcroForm 10 0 R /StructTreeRoot 12 0 R /MarkInfo << /Marked true >> >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Fm 7 0 R >> >> /Annots [8 0 R 9 0 R] /Thumb 14 0 R >>".to_vec(),
+        stream("", b"BT /F1 10 Tf 20 200 Td (SECRET-4242) Tj ET /Fm Do BT /F1 10 Tf 20 20 Td (public) Tj ET"),
+        FONT.replace("95 0 R", "6 0 R").into_bytes(),
+        widths(),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /Font << /F1 5 0 R >> >>", b"BT /F1 10 Tf 20 150 Td (SECRET-4242) Tj ET"),
+        b"<< /Type /Annot /Subtype /Text /Rect [20 120 40 140] /Contents (SECRET-4242 note) /StructParent 0 >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Widget /FT /Tx /T (ssn) /V (SECRET-4242) /Rect [20 90 120 110] /P 3 0 R >>".to_vec(),
+        b"<< /Fields [9 0 R] /CO [9 0 R] /XFA 11 0 R >>".to_vec(),
+        stream("", b"<xdp:xdp><xfa:datasets><xfa:data><form><ssn>SECRET-4242</ssn></form></xfa:data></xfa:datasets></xdp:xdp>"),
+        b"<< /Type /StructTreeRoot /K [13 0 R] >>".to_vec(),
+        b"<< /Type /StructElem /S /Annot /P 12 0 R /Alt (SECRET-4242 alt) /K [<< /Type /OBJR /Obj 8 0 R /Pg 3 0 R >>] >>".to_vec(),
+        stream("/Width 11 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"SECRET-4242"),
+    ];
+    let mut doc = pdf(objs);
+    let all = |doc: &Document| {
+        doc.object_numbers().into_iter().filter(|&n| holds(&doc.get(pdfcraft_cos::ObjRef::new(n, doc.generation(n))), secret)).count()
+    };
+    assert!(all(&doc) >= 7, "the fixture really holds the secret everywhere");
+    mark(&mut doc, 0, &[[10.0, 80.0, 250.0, 230.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.glyphs, r.forms_rewritten, r.annotations, r.fields, r.thumbnails, r.xfa_removed), (22, 1, 1, 1, 1, true), "{r:?}");
+
+    let saved = write_full(&doc, &SaveOptions::default()).unwrap();
+    assert!(!saved.windows(secret.len()).any(|w| w == secret), "the secret is in the saved bytes");
+    let back = Document::open(Arc::new(saved)).unwrap();
+    let left: Vec<u32> =
+        back.object_numbers().into_iter().filter(|&n| holds(&back.get(pdfcraft_cos::ObjRef::new(n, back.generation(n))), secret)).collect();
+    assert!(left.is_empty(), "objects still holding the secret after a save: {left:?}");
+    assert!(content(&back, 0).contains("(public)"), "content outside the mark stays");
+}
+
+#[test]
+fn a_file_cannot_tag_its_own_content_to_skip_verification() {
+    // Verification used to skip any content stream tagged `/PCMark /Redaction`, so a hostile file
+    // could hide content from it. Only the boxes this redaction stamped are skipped now.
+    let mut doc = one_page(b"BT /F1 10 Tf 20 200 Td (hidden) Tj ET", "", vec![]);
+    let p = pdfcraft_model::pages(&doc).swap_remove(0);
+    let (list, _) = page_streams(&doc, &p.dict, 0).unwrap();
+    let r = list[0].as_ref().unwrap();
+    doc.update_dict(r, |d| d.set(b"PCMark".to_vec(), Object::name("Redaction"))).unwrap();
+    let region = [[0.0, 190.0, 300.0, 220.0]];
+    assert_eq!(residue_on(&mut doc, 0, &region, &[]).unwrap(), 6, "the tagged stream is read");
+    assert_eq!(residue_on(&mut doc, 0, &region, &list).unwrap(), 0, "only what was stamped is skipped");
+    mark(&mut doc, 0, &region, "");
+    apply(&mut doc, None).unwrap();
+    assert!(!content(&doc, 0).contains("(hidden)"));
+}
+
+#[test]
+fn huge_repeated_overlay_text_is_bounded() {
+    // A mark from the file `/Rect [0 0 1e12 100]` with repeated overlay text used to allocate
+    // ~1e11 strings.
+    let look = pdfcraft_annot::OverlayLook { repeat: true, ..Default::default() };
+    let m =
+        Mark { page: 0, obj: pdfcraft_cos::ObjRef::new(1, 0), rects: vec![[0.0, 0.0, 1e12, 1e12]], fill: Some([0.0; 3]), overlay: "X".into(), look };
+    let c = overlay_content(&[&m]);
+    assert!(c.len() < 4 << 20, "{} bytes", c.len());
+}
+
+#[test]
+fn forms_that_fan_out_are_removed_not_walked() {
+    // Each form draws the next ten times, twelve deep: 10^12 visits without a budget.
+    let mut objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources << /XObject << /X 5 0 R >> >> >>".to_vec(),
+        stream("", b"/X Do"),
+    ];
+    for i in 0..12 {
+        let next = 5 + i + 1;
+        let body = if i == 11 { b"0 0 300 300 re f".to_vec() } else { b"/X Do ".repeat(10) };
+        objs.push(stream(&format!("/Type /XObject /Subtype /Form /BBox [0 0 300 300] /Resources << /XObject << /X {next} 0 R >> >>"), &body));
+    }
+    let mut doc = pdf(objs);
+    mark(&mut doc, 0, &[[10.0, 10.0, 20.0, 20.0]], "");
+    let start = std::time::Instant::now();
+    let r = apply(&mut doc, None);
+    assert!(start.elapsed() < std::time::Duration::from_secs(60), "{:?}", start.elapsed());
+    if let Ok(r) = r {
+        assert!(r.forms_removed > 0, "{r:?}");
+    }
 }

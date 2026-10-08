@@ -5590,8 +5590,8 @@ milestone = "M8"
 status = "shipped"
 commands = ["redact.apply"]
 tools = ["redact_apply"]
-evidence = ["crates/ui-egui/tests/redact.rs::marking_applying_and_clearing", "crates/engine/src/tests.rs::redaction_marks_apply_for_good_and_undo", "crates/automation/tests/automation.rs::redacting_through_tools"]
-notes = "confirmation; one undo step; next save is a full rewrite"
+evidence = ["crates/ui-egui/tests/redact.rs::marking_applying_and_clearing", "crates/engine/src/tests.rs::redaction_marks_apply_for_good_and_undo", "crates/automation/tests/automation.rs::redacting_through_tools", "crates/redact/src/tests.rs::nothing_redacted_survives_a_save", "crates/redact/src/tests.rs::outlined_text_and_signatures_lose_every_point_under_the_mark"]
+notes = "confirmation; one undo step; next save is a full rewrite. Removes text, images, vector geometry (cut, not clipped), comments, fields (with /CO, structure-tree OBJR and XFA data), and thumbnails; a full save holds none of it (end-to-end test). Not yet: content inside tiling patterns and Type 3 glyph procedures under a mark, and document-wide leftovers outside the page (bookmarks, metadata: Sanitize covers those)"
 
 [[feature]]
 id = "protect.redact-glyph-removal"

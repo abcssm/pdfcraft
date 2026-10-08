@@ -5,17 +5,21 @@
 //! - text glyphs (the rest of each line keeps its position), inline images, and paths that the
 //!   marks cover; images and vectors partly under a mark lose the covered part;
 //! - content inside form XObjects (rewritten as new objects, so pages sharing them keep theirs);
-//! - comments, links and form fields whose rectangle overlaps a mark;
+//! - comments, links and form fields whose rectangle overlaps a mark, with everything that kept
+//!   them reachable (structure-tree object references, the calculation order, the XFA data);
+//! - page thumbnails, which picture the page as it was;
 //! - the marks themselves, replaced by boxes in their fill colour (with their overlay text)
 //!   drawn into the page.
 //!
-//! A verification pass then re-reads every redacted page; if any glyph or inline image is still
-//! under a region the whole operation fails (callers keep the previous document: fail-closed).
+//! A verification pass then re-reads every redacted page; if any glyph, inline image or painted
+//! path is still under a region the whole operation fails (callers keep the previous document:
+//! fail-closed). The next save is a full rewrite, so earlier revisions don't keep the content.
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 
+mod geometry;
 mod image;
 mod interp;
 pub mod patterns;
@@ -109,6 +113,11 @@ pub struct Report {
     /// Page resource entries for images and forms the redacted page no longer draws (the
     /// originals of removed or cleared ones), dropped so the save doesn't keep them.
     pub xobjects_dropped: usize,
+    /// Page thumbnails (`/Thumb`) removed: they picture the page as it was.
+    pub thumbnails: usize,
+    /// The XFA form was removed (its data held the values of redacted fields); the AcroForm
+    /// fields remain.
+    pub xfa_removed: bool,
 }
 
 fn rect_of(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
@@ -196,6 +205,9 @@ pub(crate) fn page_streams(doc: &Document, page: &Dict, index: usize) -> Result<
     Ok((list, data))
 }
 
+/// The most times repeated overlay text is repeated across a line, and the most lines.
+const MAX_OVERLAY_REPEAT: f64 = 500.0;
+
 /// The boxes and overlay text drawn for the applied marks.
 fn overlay_content(marks: &[&Mark]) -> Vec<u8> {
     let n = |v: f64| {
@@ -236,8 +248,10 @@ fn overlay_content(marks: &[&Mark]) -> Vec<u8> {
             // One line, or as many repeated lines as fit (each line the text repeated across).
             let lines: Vec<String> = if look.repeat {
                 let unit = width(&format!("{} ", m.overlay), size).max(0.01);
-                let per_line = ((w - 2.0) / unit).floor().max(1.0) as usize;
-                let count = ((h / (size * 1.2)).floor() as usize).max(1);
+                // Capped: a mark from the file can be any size, and the text is clipped to the mark
+                // anyway (a huge `/Rect` used to abort the app allocating the lines).
+                let per_line = ((w - 2.0) / unit).floor().clamp(1.0, MAX_OVERLAY_REPEAT) as usize;
+                let count = (h / (size * 1.2)).floor().clamp(1.0, MAX_OVERLAY_REPEAT) as usize;
                 vec![vec![m.overlay.as_str(); per_line].join(" "); count]
             } else {
                 vec![m.overlay.clone()]
@@ -279,6 +293,8 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     by_page.dedup();
     report.pages = by_page.len();
     let mut doomed_fields: Vec<String> = Vec::new();
+    // Annotations and widgets taken off the pages: nothing else may keep them reachable.
+    let mut gone: std::collections::HashSet<ObjRef> = std::collections::HashSet::new();
     let widget_owner: Vec<(ObjRef, String)> =
         pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.name.clone())).collect::<Vec<_>>()).collect();
 
@@ -362,36 +378,53 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
                 }
             }
         }
-        let kept: Vec<Object> = annots
-            .into_iter()
-            .filter(|a| {
-                let Some(r) = a.as_ref() else { return true };
-                if removed.contains(&r) {
-                    return false;
-                }
-                // Pop-ups of removed annotations go too.
-                let obj = doc.get(r);
-                !obj.as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p))
-            })
-            .collect();
+        let (kept, dropped): (Vec<Object>, Vec<Object>) = annots.into_iter().partition(|a| {
+            let Some(r) = a.as_ref() else { return true };
+            if removed.contains(&r) {
+                return false;
+            }
+            // Pop-ups of removed annotations go too.
+            let obj = doc.get(r);
+            !obj.as_dict().and_then(|d| d.get(b"Parent")).and_then(Object::as_ref).is_some_and(|p| removed.contains(&p))
+        });
+        gone.extend(dropped.iter().filter_map(Object::as_ref));
+        let had_thumb = doc.get(page.obj).as_dict().is_some_and(|d| d.contains(b"Thumb"));
         doc.update_dict(page.obj, |d| {
             if kept.is_empty() {
                 d.remove(b"Annots");
             } else {
                 d.set(b"Annots".to_vec(), Object::Array(kept));
             }
+            // The thumbnail is a picture of the unredacted page.
+            d.remove(b"Thumb");
         })?;
+        report.thumbnails += usize::from(had_thumb);
     }
 
     // 3. Form fields with a widget under a mark (all their widgets go).
     for name in &doomed_fields {
-        if pdfcraft_forms::fields(doc).iter().any(|f| &f.name == name) {
+        if let Some(f) = pdfcraft_forms::fields(doc).into_iter().find(|f| &f.name == name) {
+            gone.insert(f.obj);
+            gone.extend(f.widgets.iter().map(|w| w.obj));
             pdfcraft_forms::delete_field(doc, name)?;
             report.fields += 1;
         }
     }
+    // The XFA form's data still holds the deleted fields' values: drop it and keep the AcroForm
+    // fields (what a static XFA form shows anyway).
+    if report.fields > 0 {
+        report.xfa_removed = remove_xfa(doc)?;
+    }
+    // The structure tree's object references would keep removed annotations and fields.
+    report.tags += tags::drop_objects(doc, &gone)?;
 
-    // 4. The boxes.
+    // 4. The boxes. What each page drew before them is what verification reads: a stream the file
+    // itself tagged `/PCMark /Redaction` must not be able to skip the check.
+    let mut before_boxes: std::collections::HashMap<usize, Vec<Object>> = std::collections::HashMap::new();
+    for &pi in &by_page {
+        let page = pdfcraft_model::pages(doc).swap_remove(pi);
+        before_boxes.insert(pi, page_streams(doc, &page.dict, pi)?.0);
+    }
     for &pi in &by_page {
         let page_marks: Vec<&Mark> = chosen.iter().copied().filter(|m| m.page == pi).collect();
         let content = overlay_content(&page_marks);
@@ -405,18 +438,15 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     for &pi in &by_page {
         let page = pdfcraft_model::pages(doc).swap_remove(pi);
         let rects: Vec<[f64; 4]> = chosen.iter().filter(|m| m.page == pi).flat_map(|m| m.rects.iter().copied()).collect();
-        let (list, data) = page_streams(doc, &page.dict, pi)?;
-        // The overlay stream (last) draws text of its own: the overlay label is allowed.
-        let original: Vec<Vec<u8>> = list
-            .iter()
-            .zip(data)
-            .filter(|(o, _)| doc.resolve(o).as_dict().and_then(|d| d.name(b"PCMark")) != Some(b"Redaction"))
-            .map(|(_, d)| d)
+        // The box stream just stamped draws the overlay label, which is allowed; everything that
+        // was there before is checked.
+        let before = before_boxes.get(&pi).map(Vec::as_slice).unwrap_or_default();
+        let (list, _) = page_streams(doc, &page.dict, pi)?;
+        let stamped: Vec<Object> = list
+            .into_iter()
+            .filter(|o| !before.contains(o) && doc.resolve(o).as_dict().and_then(|d| d.name(b"PCMark")) == Some(b"Redaction"))
             .collect();
-        let resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
-        let mut scratch = Report::default();
-        let mut scope = Scope::new(&rects, Mode::Verify, &mut scratch);
-        residue += process(doc, &mut scope, &original, &resources, pdfcraft_content::Matrix::IDENTITY).residue;
+        residue += residue_on(doc, pi, &rects, &stamped)?;
     }
     if residue > 0 {
         return Err(RedactError::Residue(residue));
@@ -424,6 +454,37 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
     // The previous revision still holds the removed content: the next save must rewrite.
     doc.require_full_save();
     Ok(report)
+}
+
+/// How much readable content (glyphs, inline images, vectors) still lies under `rects` on page
+/// `pi`, reading every content stream except `stamped` (the redaction boxes just drawn).
+fn residue_on(doc: &mut Document, pi: usize, rects: &[[f64; 4]], stamped: &[Object]) -> Result<usize, RedactError> {
+    let page = pdfcraft_model::pages(doc).swap_remove(pi);
+    let (list, data) = page_streams(doc, &page.dict, pi)?;
+    let read: Vec<Vec<u8>> = list.iter().zip(data).filter(|(o, _)| !stamped.contains(o)).map(|(_, d)| d).collect();
+    let resources = page.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
+    let mut scratch = Report::default();
+    let mut scope = Scope::new(rects, Mode::Verify, &mut scratch);
+    Ok(process(doc, &mut scope, &read, &resources, pdfcraft_content::Matrix::IDENTITY).residue)
+}
+
+/// Remove the XFA form (`/AcroForm /XFA`), if any. Returns whether there was one.
+fn remove_xfa(doc: &mut Document) -> Result<bool, RedactError> {
+    let Some(root) = doc.root() else { return Ok(false) };
+    match doc.get(root).as_dict().and_then(|d| d.get(b"AcroForm").cloned()) {
+        Some(Object::Ref(af)) if doc.get(af).as_dict().is_some_and(|d| d.contains(b"XFA")) => {
+            doc.update_dict(af, |d| {
+                d.remove(b"XFA");
+            })?;
+            Ok(true)
+        }
+        Some(Object::Dict(mut af)) if af.contains(b"XFA") => {
+            af.remove(b"XFA");
+            doc.update_dict(root, |d| d.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Remove redaction marks without applying them (`None` = all).

@@ -976,22 +976,50 @@ pub fn delete_field(doc: &mut Document, name: &str) -> Result<(), FormError> {
         doc.set(holder, Object::Dict(d));
         Ok(())
     };
+    let root = doc.root().ok_or(FormError::NoForm)?;
     match parent {
         Some(p) => remove_from(doc, p, b"Kids")?,
-        None => {
-            let root = doc.root().ok_or(FormError::NoForm)?;
-            match doc.get(root).as_dict().and_then(|d| d.get(b"AcroForm").cloned()) {
-                Some(Object::Ref(af)) => remove_from(doc, af, b"Fields")?,
-                // A form dictionary held directly in the catalog.
-                Some(Object::Dict(mut af)) => {
-                    let list = af.get(b"Fields").map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned()).unwrap_or_default();
-                    let kept: Vec<Object> = list.into_iter().filter(|o| o.as_ref() != Some(f.obj)).collect();
-                    af.set(b"Fields".to_vec(), Object::Array(kept));
-                    doc.update_dict(root, |d| d.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
-                }
-                _ => {}
+        None => match doc.get(root).as_dict().and_then(|d| d.get(b"AcroForm").cloned()) {
+            Some(Object::Ref(af)) => remove_from(doc, af, b"Fields")?,
+            // A form dictionary held directly in the catalog.
+            Some(Object::Dict(mut af)) => {
+                let list = af.get(b"Fields").map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned()).unwrap_or_default();
+                let kept: Vec<Object> = list.into_iter().filter(|o| o.as_ref() != Some(f.obj)).collect();
+                af.set(b"Fields".to_vec(), Object::Array(kept));
+                doc.update_dict(root, |d| d.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
+            }
+            _ => {}
+        },
+    }
+    drop_from_calculation_order(doc, root, &f.obj, &widgets)
+}
+
+/// Take a deleted field (or its widgets) out of the AcroForm's calculation order (`/CO`), which
+/// otherwise keeps it, and its value, in the file.
+fn drop_from_calculation_order(
+    doc: &mut Document,
+    root: ObjRef,
+    field: &ObjRef,
+    widgets: &std::collections::HashSet<ObjRef>,
+) -> Result<(), FormError> {
+    let gone = |o: &Object| o.as_ref().is_some_and(|r| r == *field || widgets.contains(&r));
+    let filter = |doc: &Document, af: &Dict| -> Option<Vec<Object>> {
+        let co = af.get(b"CO").map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned())?;
+        co.iter().any(gone).then(|| co.into_iter().filter(|o| !gone(o)).collect())
+    };
+    match doc.get(root).as_dict().and_then(|d| d.get(b"AcroForm").cloned()) {
+        Some(Object::Ref(af)) => {
+            if let Some(kept) = doc.get(af).as_dict().and_then(|d| filter(doc, d)) {
+                doc.update_dict(af, |d| d.set(b"CO".to_vec(), Object::Array(kept)))?;
             }
         }
+        Some(Object::Dict(mut af)) => {
+            if let Some(kept) = filter(doc, &af) {
+                af.set(b"CO".to_vec(), Object::Array(kept));
+                doc.update_dict(root, |d| d.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
