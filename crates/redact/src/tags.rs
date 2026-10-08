@@ -154,3 +154,77 @@ pub(crate) fn clean(doc: &mut Document, page: ObjRef, changed: &HashSet<i64>, em
     }
     Ok(n)
 }
+
+/// The annotation an object reference (`/Type /OBJR`, inline or indirect) points at.
+fn objr_target(doc: &Document, o: &Object) -> Option<ObjRef> {
+    let d = match o {
+        Object::Dict(d) => d.clone(),
+        Object::Ref(r) => doc.get(*r).as_dict().cloned()?,
+        _ => return None,
+    };
+    (d.name(b"Type") == Some(b"OBJR")).then(|| d.get(b"Obj").and_then(Object::as_ref)).flatten()
+}
+
+/// Drop the structure tree's object references to `removed` annotations and widgets, which
+/// otherwise keep them (and their contents, values and appearances) reachable, so the save
+/// keeps them. Elements that lose one also lose their alternate text, actual text and
+/// expansion, which may describe what was removed. Returns how many elements changed.
+pub(crate) fn drop_objects(doc: &mut Document, removed: &HashSet<ObjRef>) -> Result<usize, pdfcraft_cos::CosError> {
+    if removed.is_empty() {
+        return Ok(0);
+    }
+    let Some(root) = doc
+        .root()
+        .and_then(|r| doc.get(r).as_dict().cloned())
+        .and_then(|c| c.get(b"StructTreeRoot").map(|s| doc.resolve(s)).and_then(|s| s.as_dict().cloned()))
+    else {
+        return Ok(0);
+    };
+    let mut todo: Vec<Object> = root.get(b"K").map(|k| vec![k.clone()]).unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut hits: Vec<ObjRef> = Vec::new();
+    while let Some(k) = todo.pop() {
+        match k {
+            Object::Array(a) => todo.extend(a),
+            Object::Ref(r) => {
+                if !seen.insert(r) || seen.len() > 2_000_000 {
+                    continue;
+                }
+                let Some(d) = doc.get(r).as_dict().cloned() else { continue };
+                if !d.contains(b"S") {
+                    continue;
+                }
+                let kids: Vec<Object> = match d.get(b"K") {
+                    Some(Object::Array(a)) => a.clone(),
+                    Some(o) => vec![o.clone()],
+                    None => Vec::new(),
+                };
+                if kids.iter().any(|x| objr_target(doc, x).is_some_and(|t| removed.contains(&t))) {
+                    hits.push(r);
+                }
+                todo.extend(kids.into_iter().filter(|x| objr_target(doc, x).is_none()));
+            }
+            _ => {}
+        }
+    }
+    for &r in &hits {
+        let kids = doc.get(r).as_dict().and_then(|d| d.get(b"K").cloned());
+        let gone = |x: &Object| objr_target(doc, x).is_some_and(|t| removed.contains(&t));
+        let keep: Option<Vec<Object>> = match &kids {
+            Some(Object::Array(a)) => Some(a.iter().filter(|x| !gone(x)).cloned().collect()),
+            _ => None,
+        };
+        doc.update_dict(r, |e| {
+            for key in [&b"Alt"[..], b"ActualText", b"E"] {
+                e.remove(key);
+            }
+            match keep {
+                Some(k) => e.set(b"K".to_vec(), Object::Array(k)),
+                None => {
+                    e.remove(b"K");
+                }
+            }
+        })?;
+    }
+    Ok(hits.len())
+}

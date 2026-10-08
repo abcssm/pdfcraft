@@ -9,8 +9,8 @@
 //! - images: fully covered → the `Do` is removed; partly covered → the covered pixels are
 //!   cleared in a copy of the image (or the image is removed when its codec can't be re-encoded);
 //!   inline images under a region are removed;
-//! - vectors: fully covered paths are removed; partly covered ones are clipped so nothing shows
-//!   inside the regions; shadings are clipped the same way;
+//! - vectors: fully covered paths are removed; partly covered ones are cut (`geometry`), so no
+//!   coordinate of them stays inside a region; shadings are clipped so nothing shows there;
 //! - form XObjects under a region are rewritten recursively into new objects (copy-on-write, so
 //!   other pages using the original are untouched).
 //!
@@ -27,6 +27,9 @@ use crate::{Report, geometry, image};
 use pdfcraft_fonts::pdf::Metrics;
 
 const MAX_DEPTH: usize = 12;
+/// The most form XObjects one scope (a page and everything it draws) may visit. Depth alone
+/// doesn't bound the work: each form drawing the next ten times, twelve deep, is 10¹² visits.
+const MAX_FORM_VISITS: usize = 5000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -72,6 +75,7 @@ pub(crate) struct Scope<'a> {
     fonts: HashMap<Vec<u8>, Rc<Metrics>>,
     used_names: Vec<Vec<u8>>,
     depth: usize,
+    form_visits: usize,
 }
 
 impl<'a> Scope<'a> {
@@ -86,6 +90,7 @@ impl<'a> Scope<'a> {
             fonts: HashMap::new(),
             used_names: Vec::new(),
             depth: 0,
+            form_visits: 0,
         }
     }
 
@@ -690,8 +695,12 @@ fn xobject(
             {
                 return None;
             }
-            if scope.depth >= MAX_DEPTH {
+            scope.form_visits = scope.form_visits.saturating_add(1);
+            if scope.depth >= MAX_DEPTH || scope.form_visits > MAX_FORM_VISITS {
+                // Too deep or too many to inspect: removed (fail-closed), and in verification
+                // counted as residue rather than assumed clean.
                 if scope.mode == Mode::Verify {
+                    out.residue += 1;
                     return None;
                 }
                 scope.report.forms_removed += 1;
