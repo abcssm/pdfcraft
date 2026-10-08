@@ -570,8 +570,10 @@ impl<'a> Inspector<'a> {
         }
         for (i, page) in pages.iter_mut().enumerate() {
             let Some((&start, d)) = ranges.range(..=i).next_back() else { continue };
-            let first = d.get(b"St").ok().and_then(|o| o.as_i64().ok()).unwrap_or(1).max(1) as usize;
-            let n = first + (i - start);
+            // `/St` is untrusted: keep it positive and the sum from overflowing. `roman` and
+            // `alpha` cap their own length, so a huge start can't allocate or loop without bound.
+            let first = d.get(b"St").ok().and_then(|o| o.as_i64().ok()).unwrap_or(1).max(1);
+            let n = usize::try_from(first).unwrap_or(usize::MAX).saturating_add(i.saturating_sub(start));
             let prefix = self.text(d, b"P").unwrap_or_default();
             let number = match self.name(d, b"S").as_deref() {
                 Some("D") => n.to_string(),
@@ -935,6 +937,11 @@ fn roman(mut n: usize) -> String {
         (1, "i"),
     ];
     let mut s = String::new();
+    // Thousands are a run of "m"s: cap it like `alpha`, so a hostile `/St` can't build a huge
+    // string or loop for ages.
+    let thousands = n / 1000;
+    s.extend(std::iter::repeat_n('m', thousands.min(MAX_LABEL_REPEAT)));
+    n %= 1000;
     for (v, r) in T {
         while n >= v {
             s.push_str(r);
@@ -944,11 +951,14 @@ fn roman(mut n: usize) -> String {
     s
 }
 
+/// The longest run of one letter a generated label may contain (as `pdfcraft_organize::labels`).
+const MAX_LABEL_REPEAT: usize = 1000;
+
 /// a..z, aa..zz, aaa.. (ISO 32000-2: "a to z for the first 26 pages, aa to zz for the next 26").
 fn alpha(n: usize) -> String {
     let n = n.max(1) - 1;
     let letter = (b'a' + (n % 26) as u8) as char;
-    std::iter::repeat_n(letter, n / 26 + 1).collect()
+    std::iter::repeat_n(letter, (n / 26).saturating_add(1).min(MAX_LABEL_REPEAT)).collect()
 }
 
 /// `D:20260930104512-04'00'` → `2026-09-30 10:45`.
@@ -1033,6 +1043,32 @@ mod tests {
         assert_eq!(alpha(1), "a");
         assert_eq!(alpha(27), "aa");
         assert_eq!(alpha(53), "aaa");
+        // Bounded however large the number: these used to loop ~9e15 times or abort on an
+        // allocation of ~3.5e17 bytes.
+        assert_eq!(roman(usize::MAX).len(), MAX_LABEL_REPEAT + roman(usize::MAX % 1000).len());
+        assert_eq!(alpha(usize::MAX).len(), MAX_LABEL_REPEAT);
+    }
+
+    #[test]
+    fn a_huge_page_label_start_opens_with_bounded_labels() {
+        // `/St` near i64::MAX on every style: opening used to hang (roman), abort (alpha) or
+        // overflow (the start plus the page offset).
+        for style in ["D", "R", "r", "A", "a"] {
+            let pdf = format!(
+                "%PDF-1.7
+1 0 obj << /Type /Catalog /Pages 2 0 R /PageLabels << /Nums [0 << /S /{style} /St 9223372036854775807 >>] >> >> endobj
+2 0 obj << /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >> endobj
+3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj
+4 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >> endobj
+trailer << /Root 1 0 R >>
+%%EOF"
+            );
+            let info = inspect(Arc::new(pdf.into_bytes()), None).expect("opens");
+            assert_eq!(info.pages.len(), 2, "{style}");
+            for p in &info.pages {
+                assert!(!p.label.is_empty() && p.label.len() <= MAX_LABEL_REPEAT + 20, "{style}: {} bytes", p.label.len());
+            }
+        }
     }
 
     const ATTACHMENTS: &[u8] = b"%PDF-1.7

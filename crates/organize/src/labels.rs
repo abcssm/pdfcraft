@@ -79,6 +79,9 @@ fn roman(mut n: u32) -> String {
         (1, "i"),
     ];
     let mut s = String::new();
+    // A run of "m"s for the thousands, capped like `alpha`: `u32::MAX` would be 4 MB per label.
+    s.extend(std::iter::repeat_n('m', (n / 1000).min(1000) as usize));
+    n %= 1000;
     for (v, r) in T {
         while n >= v {
             s.push_str(r);
