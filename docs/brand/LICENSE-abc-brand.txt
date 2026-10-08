@@ -1,0 +1,12 @@
+Algoma Business Computers brand assets: license
+
+The Algoma Business Computers name and logo (abc-logo.png in this directory) are trademarks of
+Algoma Business Computers. They are NOT open source and are not covered by PdfCraft's
+MIT OR Apache-2.0 license.
+
+They are used in this fork (github.com/abcssm/pdfcraft) to identify it as the Algoma Business
+Computers build of PdfCraft, in place of the ArtCraft marks, which modified versions of PdfCraft
+may not show (see LICENSE-brand.txt).
+
+Any other use needs prior written permission from Algoma Business Computers.
+All other rights are reserved.

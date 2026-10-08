@@ -14,6 +14,8 @@ pdfcraft-engine = { workspace = true }
 pdfcraft-render = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
+# Decodes the PNG fork logo (docs/brand/abc-logo.png) through egui_extras's image loader.
+image = { version = "0.25", default-features = false, features = ["png"] }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "persistence", "links"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -50,7 +52,6 @@ pdfcraft-xfa = { workspace = true }
 pdfcraft-cos = { workspace = true }
 pdfcraft-model = { workspace = true }
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
 # Glyph-coverage test of the interface fonts; the same skrifa pdfcraft-fonts already uses.
 skrifa = "0.44"
 

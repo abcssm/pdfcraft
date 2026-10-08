@@ -1278,7 +1278,7 @@
 	Select all pages (Organize)	选择所有页面（组织页面）
 	Version {v}	版本{v}
 	A clean-room, open-source PDF application written in Rust. MIT OR Apache-2.0.	用 Rust 从零编写的开源 PDF 应用。MIT OR Apache-2.0 许可。
-	Part of	隶属于
+	Based on PdfCraft by the ArtCraft team	基于 ArtCraft 团队的 PdfCraft
 	Summarize Options	汇总选项
 	Choose a layout:	选择布局：
 	Comments only	仅注释

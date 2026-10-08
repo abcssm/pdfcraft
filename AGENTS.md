@@ -39,6 +39,8 @@ Every asset must be one of:
 
 **One narrow exception: the ArtCraft brand.** The ArtCraft name, wordmark and logos in `docs/brand/` are trademarks of the ArtCraft Team and are **not** open source (manifest identifier `LicenseRef-Storyteller-Trademark`, terms in `docs/brand/LICENSE-brand.txt`). They may be used only unmodified, only within PdfCraft, and only as `kind = "logo"` entries from that directory, to identify the project. Forks and modified versions must remove them. Never add other files under this licence, and never modify the logos.
 
+**The ABCSSM fork's brand.** This fork (github.com/abcssm/pdfcraft) is a modified version, so it does not ship the ArtCraft logos. In their place it shows the Algoma Business Computers logo, `docs/brand/abc-logo.png` (manifest identifier `LicenseRef-ABCSSM-Trademark`, terms in `docs/brand/LICENSE-abc-brand.txt`), as a `kind = "logo"` entry. The same limits apply: unmodified, only to identify this build, and no other files under this licence.
+
 Anything else is forbidden, including assets whose licence you cannot prove from the source. Examples:
 - system fonts (Apple, Microsoft, Google Android system UI fonts that are not openly licensed);
 - emoji artwork from Apple, Microsoft or Samsung;
