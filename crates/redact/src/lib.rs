@@ -106,6 +106,9 @@ pub struct Report {
     pub fields: usize,
     /// Structure elements that lost alternate/actual text or emptied marked content.
     pub tags: usize,
+    /// Page resource entries for images and forms the redacted page no longer draws (the
+    /// originals of removed or cleared ones), dropped so the save doesn't keep them.
+    pub xobjects_dropped: usize,
 }
 
 fn rect_of(doc: &Document, o: Option<&Object>) -> Option<[f64; 4]> {
@@ -310,20 +313,21 @@ pub fn apply(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Reda
         }
         if changed || !out.xobjects.is_empty() {
             let mut res = resources;
-            if !out.xobjects.is_empty() {
-                let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
-                for (n, r) in &out.xobjects {
-                    xo.set(n.clone(), Object::Ref(*r));
-                }
-                res.set(b"XObject".to_vec(), Object::Dict(xo));
+            let mut xo = res.get(b"XObject").and_then(|x| doc.resolve(x).as_dict().cloned()).unwrap_or_default();
+            for (n, r) in &out.xobjects {
+                xo.set(n.clone(), Object::Ref(*r));
             }
-            doc.update_dict(page.obj, |d| {
-                d.set(b"Contents".to_vec(), Object::Array(new_list));
-                d.set(b"Resources".to_vec(), Object::Dict(res));
-            })?;
-            // Tags must not keep what the page no longer shows.
+            doc.update_dict(page.obj, |d| d.set(b"Contents".to_vec(), Object::Array(new_list)))?;
             let after = doc.get(page.obj).as_dict().cloned().unwrap_or_default();
             let (_, new_data) = page_streams(doc, &after, pi)?;
+            // Images and forms that were removed, or replaced by cleared copies, must not stay
+            // reachable under their old names, or the save keeps the originals.
+            report.xobjects_dropped += interp::prune_xobjects(doc, &mut xo, &new_data);
+            if !xo.is_empty() || res.get(b"XObject").is_some() {
+                res.set(b"XObject".to_vec(), Object::Dict(xo));
+            }
+            doc.update_dict(page.obj, |d| d.set(b"Resources".to_vec(), Object::Dict(res)))?;
+            // Tags must not keep what the page no longer shows.
             let (changed_ids, empty_ids) = tags::touched(&data.join(&b'\n'), &new_data.join(&b'\n'));
             report.tags += tags::clean(doc, page.obj, &changed_ids, &empty_ids)?;
         }

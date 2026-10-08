@@ -148,6 +148,44 @@ fn res_dict(doc: &Document, res: &Dict, key: &[u8]) -> Dict {
     res.get(key).map(|o| doc.resolve(o)).and_then(|o| o.as_dict().cloned()).unwrap_or_default()
 }
 
+/// The most inheriting forms [`prune_xobjects`] looks inside.
+const MAX_INHERITING_FORMS: usize = 1000;
+
+/// Drop the entries of `xobjects` that `streams` no longer draw, and return how many went.
+///
+/// Redaction draws a cleared copy of an image or form under a new name, or nothing at all, but
+/// the resource dictionary still listed the original under its old name, so a save kept the
+/// unredacted original in the file. Names drawn by a form that has no `/Resources` of its own
+/// (it uses these, ISO 32000-2 §7.8.3) stay.
+pub(crate) fn prune_xobjects(doc: &Document, xobjects: &mut Dict, streams: &[Vec<u8>]) -> usize {
+    let mut drawn: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<ObjRef> = std::collections::HashSet::new();
+    let mut todo: Vec<Vec<u8>> = streams.to_vec();
+    while let Some(data) = todo.pop() {
+        for op in parse(&data).ops {
+            let Some(n) = op.name(0).filter(|_| op.is("Do")) else { continue };
+            if !drawn.insert(n.to_vec()) {
+                continue;
+            }
+            if let Some(r) = xobjects.get(n).and_then(Object::as_ref)
+                && seen.len() < MAX_INHERITING_FORMS
+                && seen.insert(r)
+                && let Object::Stream(f) = &*doc.get(r)
+                && f.dict.name(b"Subtype") == Some(b"Form")
+                && f.dict.get(b"Resources").is_none()
+                && let Ok(d) = f.decoded()
+            {
+                todo.push(d);
+            }
+        }
+    }
+    let stale: Vec<Vec<u8>> = xobjects.iter().map(|(k, _)| k.clone()).filter(|k| !drawn.contains(k)).collect();
+    for k in &stale {
+        xobjects.remove(k);
+    }
+    stale.len()
+}
+
 fn fresh_name(scope: &mut Scope<'_>, xobjects: &Dict) -> Vec<u8> {
     let mut i = scope.used_names.len() + 1;
     loop {
@@ -609,7 +647,8 @@ fn xobject(
             let res = own.clone().unwrap_or_else(|| resources.clone());
             let saved_fonts = std::mem::take(&mut scope.fonts);
             scope.depth += 1;
-            let inner = process(doc, scope, &[data], &res, fctm);
+            let data = [data];
+            let inner = process(doc, scope, &data, &res, fctm);
             scope.depth -= 1;
             scope.fonts = saved_fonts;
             out.residue += inner.residue;
@@ -622,12 +661,20 @@ fn xobject(
             }
             let mut dict = s.dict.clone();
             dict.remove(b"Length");
-            if !inner.xobjects.is_empty() {
+            let [data] = data;
+            let drawn = match &new_data {
+                Some(d) => d.clone(),
+                None => data,
+            };
+            // The copy's own resources, without what it no longer draws. A form that used its
+            // parent's resources keeps doing so unless it now draws a cleared copy.
+            if own.is_some() || !inner.xobjects.is_empty() {
                 let mut res = res;
                 let mut xo = res_dict(doc, &res, b"XObject");
                 for (n, r) in &inner.xobjects {
                     xo.set(n.clone(), Object::Ref(*r));
                 }
+                prune_xobjects(doc, &mut xo, std::slice::from_ref(&drawn));
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
                 dict.set(b"Resources".to_vec(), Object::Dict(res));
             }
