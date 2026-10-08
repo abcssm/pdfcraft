@@ -95,6 +95,19 @@ fn util_printf_printd_and_printx() {
 }
 
 #[test]
+fn util_printf_caps_huge_widths_and_precisions() {
+    // These asked for a terabyte of padding or digits: the allocation failure aborted the app,
+    // and in debug builds the width overflowed.
+    let o = go(
+        "event.value = [util.printf('%999999999999999999999999d', 1).length, util.printf('%0999999999999d', -1).length, \
+         util.printf('%.999999999999f', 1).length, util.printf('%.99999999999s', 'abc')].join('|');",
+        &Event::field("Calculate", "total", ""),
+    );
+    assert_eq!(o.error, None);
+    assert_eq!(o.value, "1024|1024|1026|abc");
+}
+
+#[test]
 fn document_requests_and_console() {
     let o = go(
         "console.println('hello ' + this.documentFileName + ' ' + numPages + ' ' + info.title); this.pageNum = 2; \

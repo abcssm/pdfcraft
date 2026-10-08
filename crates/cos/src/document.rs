@@ -223,6 +223,14 @@ impl Document {
             }
             doc.reconstruct(&mut log)?;
         }
+        // Object numbers past the limit can't be kept: new objects are numbered after the
+        // highest one, and `u32` arithmetic on numbers near `u32::MAX` would wrap onto (and
+        // overwrite) existing objects.
+        if doc.entries.keys().next_back().is_some_and(|&n| n > MAX_OBJECT_NUMBER) {
+            let entries = Arc::make_mut(&mut doc.entries);
+            let dropped = entries.split_off(&(MAX_OBJECT_NUMBER + 1)).len();
+            log.push(format!("ignored {dropped} cross-reference entries numbered above {MAX_OBJECT_NUMBER}"));
+        }
         doc.repair_log = Arc::new(log);
         // Reconstruction may have found a different trailer: (re)authenticate against it.
         if (!ok || !authenticated)
@@ -231,8 +239,8 @@ impl Document {
             doc.authenticate(&enc, password)?;
         }
         let max = doc.entries.keys().next_back().copied().unwrap_or(0);
-        let size = doc.trailer.int(b"Size").unwrap_or(0).max(0) as u32;
-        doc.next_num = max.max(size.saturating_sub(1)) + 1;
+        let size = doc.trailer.int(b"Size").unwrap_or(0).clamp(0, i64::from(MAX_OBJECT_NUMBER) + 1) as u32; // in range: clamped
+        doc.next_num = max.max(size.saturating_sub(1)).saturating_add(1);
         Ok(doc)
     }
 
@@ -579,14 +587,16 @@ impl Document {
     pub fn set(&mut self, r: ObjRef, obj: impl Into<Object>) {
         self.overlay.insert(r.num, Slot::Set(r.generation, Arc::new(obj.into())));
         if r.num >= self.next_num {
-            self.next_num = r.num + 1;
+            self.next_num = r.num.saturating_add(1);
         }
     }
 
     /// Add a new indirect object and return its reference.
     pub fn add(&mut self, obj: impl Into<Object>) -> ObjRef {
+        // Can't overflow in practice: numbers start at most at MAX_OBJECT_NUMBER + 1, far below
+        // `u32::MAX`, which the writer reserves as a marker.
         let r = ObjRef::new(self.next_num, 0);
-        self.next_num += 1;
+        self.next_num = self.next_num.saturating_add(1);
         self.overlay.insert(r.num, Slot::Set(0, Arc::new(obj.into())));
         r
     }
@@ -944,6 +954,11 @@ fn valid_xref_range(start: i64, count: i64) -> bool {
     u32::try_from(start).is_ok() && count >= 0 && start.checked_add(count).is_some_and(|end| end <= i64::from(u32::MAX) + 1)
 }
 
+/// The highest object number a document may use. Far above the classic limit (ISO 32000-1
+/// Annex C: 8,388,607) so lenient reading keeps odd files, and far below `u32::MAX` so numbering
+/// new objects after the highest one can never wrap or reach the writer's reserved marker.
+pub(crate) const MAX_OBJECT_NUMBER: u32 = i32::MAX as u32;
+
 /// The most indirect objects a document can have (the classic implementation limit, ISO
 /// 32000-1 Annex C): it bounds how much data a cross-reference stream can hold.
 const MAX_XREF_OBJECTS: usize = 8_388_607;
@@ -967,6 +982,38 @@ mod tests {
         }
         out.extend_from_slice(format!("trailer\n<< /Size {} {trailer} >>\nstartxref\n{xref}\n%%EOF\n", bodies.len() + 1).as_bytes());
         out
+    }
+
+    #[test]
+    fn huge_object_numbers_never_make_new_objects_wrap_onto_old_ones() {
+        // A free entry numbered u32::MAX, or a `/Size` of u32::MAX, made the next new object
+        // number overflow: a panic in debug builds, and in release `add` handed out 0, 1, ...
+        // overwriting the catalog.
+        let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
+        let pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+        let mut files = vec![build(&[catalog, pages], "/Root 1 0 R").replace_size("/Size 4294967295")];
+        let mut bytes = build(&[catalog, pages], "/Root 1 0 R");
+        let tail = bytes.windows(9).rposition(|w| w == b"trailer\n<").unwrap();
+        bytes.splice(tail..tail, b"4294967295 1\n0000000000 65535 f \n".iter().copied());
+        files.push(bytes);
+        for bytes in files {
+            let mut doc = Document::open(Arc::new(bytes)).unwrap();
+            let r = doc.add(Object::Int(7));
+            assert!(r.num > 2 && r.num <= MAX_OBJECT_NUMBER + 1, "{r:?}");
+            assert_eq!(doc.get(ObjRef::new(1, 0)).as_dict().and_then(|d| d.get(b"Type")).cloned(), Some(Object::name("Catalog")));
+            let again = doc.add(Object::Int(8));
+            assert_ne!(again.num, u32::MAX);
+            assert!(again.num > r.num);
+        }
+    }
+
+    trait ReplaceSize {
+        fn replace_size(self, with: &str) -> Vec<u8>;
+    }
+    impl ReplaceSize for Vec<u8> {
+        fn replace_size(self, with: &str) -> Vec<u8> {
+            String::from_utf8(self).unwrap().replace("/Size 3", with).into_bytes()
+        }
     }
 
     #[test]

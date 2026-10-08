@@ -1327,7 +1327,7 @@
 	Discard	破棄
 	Version {v}	バージョン {v}
 	A clean-room, open-source PDF application written in Rust. MIT OR Apache-2.0.	Rust で記述したクリーンルーム方式のオープンソース PDF アプリケーション。MIT OR Apache-2.0。
-	Part of	関連プロジェクト
+	Based on PdfCraft by the ArtCraft team	ArtCraft チームの PdfCraft をもとにしています
 	Summarize Options	一覧のオプション
 	Choose a layout:	レイアウトを選択:
 	Comments only	注釈のみ

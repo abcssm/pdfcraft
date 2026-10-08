@@ -222,6 +222,10 @@ fn images_are_removed_or_have_their_pixels_cleared() {
     assert_eq!(s.decoded().unwrap(), [0, 0, 255, 255], "pixels 1–2 (x 100–120) cleared");
     let Object::Stream(orig) = &*doc.get(ObjRef::new(7, 0)) else { panic!() };
     assert_eq!(orig.decoded().unwrap(), [255; 4], "the shared original is untouched");
+    // …but the page no longer lists it, so the redacted pixels don't survive a save.
+    assert!(xo.iter().all(|(_, v)| v.as_ref() != Some(ObjRef::new(7, 0))), "{xo:?}");
+    assert!(!xo.contains(b"Im1") && !xo.contains(b"Im2"), "{xo:?}");
+    assert_eq!(r.xobjects_dropped, 2);
 }
 
 #[test]

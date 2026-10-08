@@ -1320,7 +1320,7 @@
 	Discard	Abandonner
 	Version {v}	Version {v}
 	A clean-room, open-source PDF application written in Rust. MIT OR Apache-2.0.	Une application PDF open source, en salle blanche, écrite en Rust. MIT OR Apache-2.0.
-	Part of	Partie de
+	Based on PdfCraft by the ArtCraft team	Basé sur PdfCraft de l'équipe ArtCraft
 	Summarize Options	Options du résumé
 	Choose a layout:	Choisissez une disposition :
 	Comments only	Commentaires seulement

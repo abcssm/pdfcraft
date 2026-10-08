@@ -49,7 +49,10 @@ fn about_dialog_shows_the_brand_and_links() {
         app.open_bytes("one.pdf", None, pdf.to_vec()).unwrap();
         app.dialog = Some(Dialog::About);
     });
-    assert!(h.query_all_by_label("ArtCraft").count() >= 2, "the mark and the wordmark (alt text)");
+    // This fork shows its own logo and credits ArtCraft in plain text only (docs/brand/LICENSE-brand.txt).
+    assert!(h.query_by_label("Algoma Business Computers").is_some(), "the fork's logo (alt text)");
+    assert!(h.query_by_label("Based on PdfCraft by the ArtCraft team").is_some());
+    assert_eq!(h.query_all_by_label("ArtCraft").count(), 0, "no ArtCraft marks");
     h.get_by_label("Join our Discord").click();
     h.run_steps(2);
     assert_eq!(h.state().last_opened_url.as_deref(), Some(links::DISCORD));

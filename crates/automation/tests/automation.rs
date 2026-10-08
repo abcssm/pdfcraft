@@ -541,6 +541,23 @@ fn mcp_session_over_stdio() {
 
 #[cfg(feature = "mcp")]
 #[test]
+fn a_line_that_is_not_utf8_gets_a_parse_error_and_the_session_goes_on() {
+    // `lines()` returned an error on the stray Latin-1 byte, which ended the server.
+    let mut input =
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"doc_open\",\"arguments\":{\"path\":\"caf\xe9.pdf\"}}}\r\n"
+            .to_vec();
+    input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\r\n");
+    let mut out = Vec::new();
+    McpServer::new(Automation::new()).serve(input.as_slice(), &mut out).unwrap();
+    let replies: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert_eq!(replies[0]["error"]["code"], -32700);
+    assert_eq!(replies[1]["id"], 2);
+    assert!(replies[1]["result"].is_object());
+}
+
+#[cfg(feature = "mcp")]
+#[test]
 fn mcp_errors() {
     let mut s = McpServer::new(Automation::new());
     assert_eq!(rpc(&mut s, 1, "initialize", json!({ "protocolVersion": "1999-01-01" }))["result"]["protocolVersion"], "2025-06-18");

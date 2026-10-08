@@ -134,7 +134,17 @@ impl Automation {
     }
 
     /// Run the tool `name` with JSON `args` (an object; `null` means no arguments).
+    ///
+    /// Behind the last-resort guard (AGENTS.md §4), like the desktop app's commands: a bug that
+    /// panics on a hostile file becomes an error for the agent instead of ending the process,
+    /// and with it every other open document's unsaved work. Edits run on a copy and only
+    /// replace the document when they succeed, so a failed call leaves it as it was.
     pub fn call(&mut self, name: &str, args: &Value) -> Result<Vec<Content>> {
+        pdfcraft_engine::guard(|| self.call_unguarded(name, args))
+            .unwrap_or_else(|panic| Err(failed(format!("{name} failed with an internal error ({panic}); open documents are unchanged"))))
+    }
+
+    fn call_unguarded(&mut self, name: &str, args: &Value) -> Result<Vec<Content>> {
         let empty = json!({});
         let args = if args.is_null() { &empty } else { args };
         if !args.is_object() {
@@ -1726,14 +1736,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(failed(format!("{}: is a folder, not a file", path.display())));
     }
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = path.file_name().ok_or_else(|| failed(format!("{}: not a file path", path.display())))?;
+    if path.file_name().is_none() {
+        return Err(failed(format!("{}: not a file path", path.display())));
+    }
     std::fs::create_dir_all(dir).map_err(|e| failed(format!("{}: {e}", dir.display())))?;
-    let tmp = dir.join(format!(".{}.pdfcraft-tmp", name.to_string_lossy()));
-    std::fs::write(&tmp, bytes).map_err(|e| failed(format!("{}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        failed(format!("{}: {e}", path.display()))
-    })
+    // The temporary file is created exclusively under a random name, so a link planted in the
+    // root can't redirect the write outside it.
+    pdfcraft_engine::fsutil::write_atomic(path, bytes).map_err(|e| failed(format!("{}: {e}", path.display())))
 }
 
 #[cfg(test)]

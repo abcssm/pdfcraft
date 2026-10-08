@@ -617,9 +617,11 @@ fn printf(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
             }
             chars.next();
         }
+        // Width and precision come from the script: capped, so `%999999999999d` can't ask for
+        // a terabyte of padding (an allocation failure aborts the whole app).
         let mut width = 0usize;
         while let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
-            width = width * 10 + d as usize;
+            width = width.saturating_mul(10).saturating_add(d as usize).min(MAX_PRINTF_FIELD);
             chars.next();
         }
         let mut prec = None;
@@ -627,7 +629,7 @@ fn printf(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
             chars.next();
             let mut p = 0usize;
             while let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
-                p = p * 10 + d as usize;
+                p = p.saturating_mul(10).saturating_add(d as usize).min(MAX_PRINTF_FIELD);
                 chars.next();
             }
             prec = Some(p);
@@ -672,6 +674,9 @@ fn printf(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
     }
     Ok(s(&out))
 }
+
+/// The widest field and the longest precision `util.printf` honours.
+const MAX_PRINTF_FIELD: usize = 1024;
 
 /// Group the integer part of a plain decimal number per `util.printf`'s `,n` flag.
 fn group(t: &str, sep: u8) -> String {

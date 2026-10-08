@@ -193,23 +193,63 @@ fn main() -> eframe::Result {
 }
 
 /// Write the control endpoint so that only the current user can read the token.
+///
+/// Whatever is already at `path` is removed (a link is removed, not followed) and the file is
+/// created afresh and exclusively, so a planted link can't redirect the write. It is owner-only
+/// before the token goes in: mode 0600 on Unix, and on Windows an explicit DACL granting only the
+/// current user (otherwise it would inherit the folder's ACL, often readable by every user).
 fn write_control_file(path: &str, port: u16, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
     let json = serde_json::json!({ "port": port, "token": token, "pid": std::process::id() }).to_string();
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    use std::io::Write;
     let mut f = opts.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    #[cfg(windows)]
+    if let Err(e) = restrict_to_current_user(path) {
+        drop(f);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
     }
-    f.write_all(json.as_bytes())
+    f.write_all(json.as_bytes())?;
+    f.sync_all()
+}
+
+/// Replace `path`'s ACL with a single entry: full control for the current user. Runs the system's
+/// `whoami` and `icacls` by absolute path, because the workspace forbids the `unsafe` FFI the
+/// security API would need.
+#[cfg(windows)]
+fn restrict_to_current_user(path: &str) -> std::io::Result<()> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let system32 = std::path::Path::new(&root).join("System32");
+    let out = std::process::Command::new(system32.join("whoami.exe")).args(["/user", "/fo", "csv", "/nh"]).output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sid = current_user_sid(&text).filter(|_| out.status.success());
+    let Some(sid) = sid else {
+        return Err(std::io::Error::other("could not determine the current user's SID"));
+    };
+    let status = std::process::Command::new(system32.join("icacls.exe"))
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r", &format!("*{sid}:F"), "/q"])
+        .stdout(std::process::Stdio::null())
+        .status()?;
+    if status.success() { Ok(()) } else { Err(std::io::Error::other(format!("icacls could not restrict {path} to the current user"))) }
+}
+
+/// The SID in `whoami /user /fo csv /nh` output (`"DOMAIN\user","S-1-5-21-…"`).
+#[cfg(any(windows, test))]
+fn current_user_sid(csv: &str) -> Option<&str> {
+    let sid = csv.trim().rsplit(',').next()?.trim_matches('"');
+    (sid.starts_with("S-1-") && sid.bytes().all(|b| b.is_ascii_digit() || b == b'-' || b == b'S')).then_some(sid)
 }
 
 /// How wgpu finds a GPU. Each choice yields to its wgpu environment variable.
@@ -308,6 +348,38 @@ fn pick_adapter(adapters: &[(u32, u32, eframe::wgpu::DeviceType)], displays: &[(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_control_file_replaces_whatever_was_there_and_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ctl.json");
+        std::fs::write(&path, "stale contents that are longer than the new ones").unwrap();
+        super::write_control_file(&path.to_string_lossy(), 1234, "0123456789abcdef0123456789abcdef").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!((v["port"].as_u64(), v["token"].as_str()), (Some(1234), Some("0123456789abcdef0123456789abcdef")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        #[cfg(windows)]
+        {
+            // One explicit entry for us, nothing inherited (an inherited entry is marked "(I)").
+            let out = std::process::Command::new("icacls").arg(&path).output().unwrap();
+            let acl = String::from_utf8_lossy(&out.stdout);
+            assert!(!acl.contains("(I)") && !acl.contains("Users:") && !acl.contains("Everyone"), "{acl}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sid_is_read_from_whoami_output() {
+        assert_eq!(super::current_user_sid("\"DESKTOP\\greg\",\"S-1-5-21-1-2-3-1001\"\r\n"), Some("S-1-5-21-1-2-3-1001"));
+        assert_eq!(super::current_user_sid("ERROR: no"), None);
+        assert_eq!(super::current_user_sid("\"x\",\"S-1-5 /grant Everyone\""), None);
+    }
+
     #[test]
     fn gpu_backends_avoid_vulkan_on_windows_and_prefer_low_power() {
         let mut native = eframe::NativeOptions::default();

@@ -455,10 +455,17 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
         }
         None => cache.digest(s.digest, bytes, l0, o1, covered),
     };
-    if let Some(md) = &s.message_digest
-        && *md != content_digest
-    {
-        return invalid(info, "The document has been altered or corrupted since the signature was applied.");
+    // With signed attributes the signature covers only them; the messageDigest attribute is
+    // what binds it to the document (RFC 5652 §5.3 makes it mandatory). Without it, the
+    // signature says nothing about these bytes.
+    match &s.message_digest {
+        Some(md) if *md != content_digest => {
+            return invalid(info, "The document has been altered or corrupted since the signature was applied.");
+        }
+        None if s.signed_attrs.is_some() => {
+            return invalid(info, "The signature does not say which document it signs: its message digest is missing.");
+        }
+        _ => {}
     }
     let Some(cert) = sd.signer_certificate().cloned() else {
         return invalid(info, "The signer's certificate is not in the signature.");
@@ -640,10 +647,12 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
     if doc_digest != token.imprint {
         return invalid(info, "The document has been altered or corrupted since the timestamp was applied.");
     }
+    let mut tsa_in_date = true;
     if let Some(cert) = token.signer_certificate() {
         info.signer = Some(cert.display_name());
         info.certificate = Some(cert.clone());
         if !cert.valid_at(token.gen_time) {
+            tsa_in_date = false;
             info.status = Status::Unknown;
             info.details.push("The timestamp authority's certificate was not valid at the time of timestamping.".into());
         }
@@ -670,9 +679,13 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
         let mut pool = crate::timestamp::token_certs(&contents);
         pool.extend(trust.certs.iter().cloned());
         let trusted_tsa = token.signer_certificate().map(|c| build_chain(&c, &pool).iter().any(|x| trust.trusts(x))).unwrap_or(false);
-        if trusted_tsa {
+        // An authority whose certificate had expired (or wasn't yet valid) vouches for nothing,
+        // trusted or not: the verdict stays Unknown.
+        if trusted_tsa && tsa_in_date {
             info.status = Status::Valid;
             info.details.push("The timestamp token is valid and its authority is trusted.".into());
+        } else if trusted_tsa {
+            info.status = Status::Unknown;
         } else {
             info.status = Status::Unknown;
             info.details.push("The timestamp token is valid, but the timestamp authority is not in your list of trusted certificates.".into());
